@@ -1,0 +1,433 @@
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+import seaborn as sns
+from sklearn.ensemble import StackingRegressor
+from sklearn.linear_model import Ridge
+from sklearn.metrics import mean_squared_error, mean_absolute_error, r2_score
+from sklearn.model_selection import cross_val_score, KFold
+from sklearn.preprocessing import StandardScaler
+import joblib
+import warnings
+warnings.filterwarnings('ignore')
+
+plt.rcParams['font.sans-serif'] = ['DejaVu Sans']
+plt.rcParams['axes.unicode_minus'] = False
+
+def mape(y_true, y_pred, eps=1e-8):
+    """Mean Absolute Percentage Error (avoid division by zero)"""
+    return np.mean(np.abs((y_true - y_pred) / (np.abs(y_true) + eps)))
+
+class StackingRegressorOptimizer:
+    """TOPSIS-based regression stacking model optimizer"""
+    
+    def __init__(self, X_train, X_test, y_train, y_test):
+        self.X_train = X_train
+        self.X_test = X_test
+        self.y_train = y_train
+        self.y_test = y_test
+        
+        self.model_abbreviations = {
+            'GBRT': 'GB',
+            'Extra Trees': 'ET',
+            'XGBoost': 'XGB',
+            'Random Forest': 'RF',
+            'CatBoost': 'CB',
+            'Bagging': 'Bag'
+        }
+        
+        self.stacking_models = {}
+        self.metrics_results = {}
+        
+    def load_optimized_models(self, model_paths):
+        """Load optimized base models"""
+        base_models = {}
+        for name, path in model_paths.items():
+            try:
+                base_models[name] = joblib.load(path)
+                print(f"Loaded: {name} -> {self.model_abbreviations.get(name, name)}")
+            except Exception as e:
+                print(f"Failed to load {name}: {e}")
+        return base_models
+    
+    def calculate_regression_metrics(self, y_true, y_pred):
+        """Calculate regression evaluation metrics"""
+        rmse = np.sqrt(mean_squared_error(y_true, y_pred))
+        mae = mean_absolute_error(y_true, y_pred)
+        r2 = r2_score(y_true, y_pred)
+        mape_val = mape(y_true, y_pred)
+        return {
+            'MAPE': mape_val,
+            'RMSE': rmse,
+            'MAE': mae,
+            'R2': r2
+        }
+    
+    def generate_stacking_combinations(self, base_models, max_combination_size=6):
+        """Generate stacking model combinations using abbreviations"""
+        from itertools import combinations
+        
+        model_names = list(base_models.keys())
+        stacking_combinations = {}
+        
+        # Single models (as baseline)
+        for name in model_names:
+            abbrev = self.model_abbreviations.get(name, name)
+            stacking_combinations[f"Single_{abbrev}"] = [(name, base_models[name])]
+        
+        # Multi-model combinations
+        for r in range(2, min(max_combination_size + 1, len(model_names) + 1)):
+            for combo in combinations(model_names, r):
+                abbrev_combo = [self.model_abbreviations.get(name, name) for name in combo]
+                model_key = "_".join(sorted(abbrev_combo))
+                estimators = [(name, base_models[name]) for name in combo]
+                stacking_combinations[model_key] = estimators
+        
+        print(f"Generated {len(stacking_combinations)} stacking combinations")
+        return stacking_combinations
+    
+    def evaluate_stacking_model(self, estimators, model_name):
+        """Evaluate a stacking regression model (train and test metrics)"""
+        try:
+            final_estimator = Ridge(alpha=1.0, random_state=42)
+            stacking_model = StackingRegressor(
+                estimators=estimators,
+                final_estimator=final_estimator,
+                cv=5,
+                passthrough=False,
+                n_jobs=-1
+            )
+            stacking_model.fit(self.X_train, self.y_train)
+            y_test_pred = stacking_model.predict(self.X_test)
+            y_train_pred = stacking_model.predict(self.X_train)
+            
+            test_metrics = self.calculate_regression_metrics(self.y_test, y_test_pred)
+            train_metrics = self.calculate_regression_metrics(self.y_train, y_train_pred)
+            
+            cv_scores = cross_val_score(
+                stacking_model, self.X_train, self.y_train,
+                cv=KFold(5, shuffle=True, random_state=42),
+                scoring='neg_mean_squared_error'
+            )
+            cv_rmse = np.sqrt(-cv_scores)
+            
+            estimator_abbrevs = [self.model_abbreviations.get(name, name) for name, _ in estimators]
+            
+            metrics = {'Test_' + k: v for k, v in test_metrics.items()}
+            metrics.update({'Train_' + k: v for k, v in train_metrics.items()})
+            metrics.update({
+                'CV_RMSE_Mean': cv_rmse.mean(),
+                'CV_RMSE_Std': cv_rmse.std(),
+                'model': stacking_model,
+                'estimators': [name for name, _ in estimators],
+                'estimators_abbrev': estimator_abbrevs
+            })
+            print(f"Evaluated {model_name}: Test RMSE = {test_metrics['RMSE']:.4f}, R2 = {test_metrics['R2']:.4f}")
+            return metrics
+        except Exception as e:
+            print(f"Evaluation failed for {model_name}: {e}")
+            return None
+    
+    def evaluate_all_stacking_models(self, base_models):
+        """Evaluate all stacking models"""
+        combinations = self.generate_stacking_combinations(base_models)
+        for model_name, estimators in combinations.items():
+            print(f"\nEvaluating: {model_name}")
+            print(f"Base models: {[self.model_abbreviations.get(name, name) for name, _ in estimators]}")
+            metrics = self.evaluate_stacking_model(estimators, model_name)
+            if metrics:
+                self.metrics_results[model_name] = metrics
+                self.stacking_models[model_name] = metrics['model']
+        print(f"\nSuccessfully evaluated {len(self.metrics_results)} models")
+        return self.metrics_results
+    
+    def create_metrics_dataframe(self):
+        """Create metrics DataFrame"""
+        if not self.metrics_results:
+            print("No evaluation results")
+            return None
+        metrics_data = []
+        for model_name, metrics in self.metrics_results.items():
+            row = {'Model': model_name}
+            for k, v in metrics.items():
+                if k not in ['model', 'estimators', 'estimators_abbrev']:
+                    row[k] = v
+            row['Base_Models'] = ', '.join(metrics['estimators_abbrev'])
+            metrics_data.append(row)
+        return pd.DataFrame(metrics_data)
+    
+    def topsis_ranking(self, metrics_df, weights=None):
+        """TOPSIS multi-criteria decision ranking for regression metrics"""
+        metrics_columns = ["Test_RMSE", "Test_MAE", "Test_MAPE", "Test_R2"]
+        if weights is None:
+            weights = {
+                "Test_RMSE": 0.30,
+                "Test_MAE": 0.20,
+                "Test_MAPE": 0.25,
+                "Test_R2": 0.25
+            }
+        decision_matrix = metrics_df[metrics_columns].values.copy()
+        normalized_matrix = decision_matrix / np.sqrt((decision_matrix**2).sum(axis=0))
+        weight_vector = np.array([weights[col] for col in metrics_columns])
+        weighted_matrix = normalized_matrix * weight_vector
+        
+        ideal_best = weighted_matrix.copy()
+        ideal_worst = weighted_matrix.copy()
+        for i, col in enumerate(metrics_columns):
+            if col in ["Test_RMSE", "Test_MAE", "Test_MAPE"]:
+                ideal_best[:, i] = weighted_matrix[:, i].min()
+                ideal_worst[:, i] = weighted_matrix[:, i].max()
+            else:
+                ideal_best[:, i] = weighted_matrix[:, i].max()
+                ideal_worst[:, i] = weighted_matrix[:, i].min()
+        
+        dist_best = np.sqrt(((weighted_matrix - ideal_best) ** 2).sum(axis=1))
+        dist_worst = np.sqrt(((weighted_matrix - ideal_worst) ** 2).sum(axis=1))
+        performance_scores = dist_worst / (dist_best + dist_worst)
+        
+        ranked_df = metrics_df.copy()
+        ranked_df['TOPSIS_Score'] = performance_scores
+        ranked_df['TOPSIS_Rank'] = ranked_df['TOPSIS_Score'].rank(ascending=False)
+        
+        topsis_params = []
+        for i, model_name in enumerate(metrics_df['Model']):
+            param_row = {
+                'Model': model_name,
+                'TOPSIS_Score': performance_scores[i],
+                'TOPSIS_Rank': ranked_df['TOPSIS_Rank'].iloc[i],
+                'Distance_to_Best': dist_best[i],
+                'Distance_to_Worst': dist_worst[i]
+            }
+            for j, col in enumerate(metrics_columns):
+                param_row[f'{col}_Original'] = decision_matrix[i, j]
+                param_row[f'{col}_Normalized'] = normalized_matrix[i, j]
+                param_row[f'{col}_Weighted'] = weighted_matrix[i, j]
+                param_row[f'{col}_Weight'] = weight_vector[j]
+            topsis_params.append(param_row)
+        topsis_params_df = pd.DataFrame(topsis_params)
+        ranked_df = ranked_df.sort_values('TOPSIS_Score', ascending=False)
+        topsis_params_df = topsis_params_df.sort_values('TOPSIS_Score', ascending=False)
+        return ranked_df, topsis_params_df
+    
+    def comprehensive_ranking_analysis(self, metrics_df):
+        """Compare TOPSIS ranking with traditional ranking methods"""
+        ranked_df, topsis_params_df = self.topsis_ranking(metrics_df)
+        traditional_df = metrics_df.copy()
+        traditional_df["RMSE_Rank"] = traditional_df["Test_RMSE"].rank(ascending=True)
+        traditional_df["MAE_Rank"] = traditional_df["Test_MAE"].rank(ascending=True)
+        traditional_df["MAPE_Rank"] = traditional_df["Test_MAPE"].rank(ascending=True)
+        traditional_df["R2_Rank"] = traditional_df["Test_R2"].rank(ascending=False)
+        rank_columns = ["RMSE_Rank", "MAE_Rank", "MAPE_Rank", "R2_Rank"]
+        traditional_df["Traditional_Rank"] = traditional_df[rank_columns].mean(axis=1)
+        comparison_df = ranked_df[['Model', 'TOPSIS_Score', 'TOPSIS_Rank', 'Base_Models']].copy()
+        comparison_df['Traditional_Rank'] = traditional_df['Traditional_Rank']
+        for col in ["Test_RMSE", "Test_MAE", "Test_R2"]:
+            comparison_df[col] = traditional_df[col]
+        return comparison_df.sort_values('TOPSIS_Rank'), topsis_params_df
+    
+    def save_all_metrics(self, metrics_df):
+        """Save all evaluation metrics to CSV files"""
+        test_columns = ['Model', 'Base_Models'] + [col for col in metrics_df.columns if col.startswith('Test_')]
+        test_metrics_df = metrics_df[test_columns].copy()
+        test_metrics_df.columns = [col.replace('Test_', '') if col not in ['Model', 'Base_Models'] else col for col in test_metrics_df.columns]
+        test_metrics_df.to_csv('stacking_models_test_metrics.csv', index=False)
+        print("Test metrics saved to: stacking_models_test_metrics.csv")
+        
+        print("\n" + "="*80)
+        print("Test Set Metrics (Top 10 Models):")
+        print("="*80)
+        display_test_columns = ['Model', 'Base_Models', 'RMSE', 'MAE', 'R2']
+        print(test_metrics_df[display_test_columns].head(10).round(4).to_string(index=False))
+        
+        train_columns = ['Model', 'Base_Models'] + [col for col in metrics_df.columns if col.startswith('Train_')]
+        train_metrics_df = metrics_df[train_columns].copy()
+        train_metrics_df.columns = [col.replace('Train_', '') if col not in ['Model', 'Base_Models'] else col for col in train_metrics_df.columns]
+        train_metrics_df.to_csv('stacking_models_train_metrics.csv', index=False)
+        print("\nTrain metrics saved to: stacking_models_train_metrics.csv")
+        
+        metrics_df.to_csv('stacking_models_all_metrics.csv', index=False)
+        print("Full metrics saved to: stacking_models_all_metrics.csv")
+    
+    def plot_ranking_comparison(self, comparison_df):
+        """Plot ranking comparison charts"""
+        fig, axes = plt.subplots(2, 2, figsize=(16, 12))
+        top_10 = comparison_df.head(10)
+        models = top_10['Model']
+        topsis_scores = top_10['TOPSIS_Score']
+        
+        axes[0, 0].barh(range(len(models)), topsis_scores, color='lightblue')
+        axes[0, 0].set_yticks(range(len(models)))
+        axes[0, 0].set_yticklabels(models)
+        axes[0, 0].set_xlabel('TOPSIS Score')
+        axes[0, 0].set_title('Top 10 Models - TOPSIS Score Ranking')
+        for i, v in enumerate(topsis_scores):
+            axes[0, 0].text(v + 0.01, i, f'{v:.3f}', va='center')
+        
+        traditional_ranks = top_10['Traditional_Rank']
+        topsis_ranks = top_10['TOPSIS_Rank']
+        x_pos = np.arange(len(models))
+        width = 0.35
+        axes[0, 1].bar(x_pos - width/2, traditional_ranks, width, label='Traditional Rank', alpha=0.7)
+        axes[0, 1].bar(x_pos + width/2, topsis_ranks, width, label='TOPSIS Rank', alpha=0.7)
+        axes[0, 1].set_xlabel('Model')
+        axes[0, 1].set_ylabel('Rank')
+        axes[0, 1].set_title('Traditional vs TOPSIS Ranking')
+        axes[0, 1].set_xticks(x_pos)
+        axes[0, 1].set_xticklabels(models, rotation=45, ha='right')
+        axes[0, 1].legend()
+        axes[0, 1].invert_yaxis()
+        
+        metrics_columns = ["Test_RMSE", "Test_MAE", "Test_R2"]
+        top_3_models = comparison_df.head(3)
+        angles = np.linspace(0, 2*np.pi, len(metrics_columns), endpoint=False).tolist()
+        angles += angles[:1]
+        for i, (_, row) in enumerate(top_3_models.iterrows()):
+            values = [row[col] for col in metrics_columns]
+            values_scaled = [1/v if j<2 else v for j, v in enumerate(values)]
+            values_scaled += values_scaled[:1]
+            axes[1, 0].plot(angles, values_scaled, 'o-', linewidth=2, label=row['Model'])
+            axes[1, 0].fill(angles, values_scaled, alpha=0.1)
+        axes[1, 0].set_xticks(angles[:-1])
+        axes[1, 0].set_xticklabels([col.replace('Test_', '') for col in metrics_columns])
+        axes[1, 0].set_title('Top 3 Models Radar Chart (RMSE/MAE inverted)')
+        axes[1, 0].legend()
+        
+        scatter = axes[1, 1].scatter(comparison_df['Test_R2'], comparison_df['TOPSIS_Score'],
+                                     c=comparison_df['Traditional_Rank'], cmap='viridis', s=100, alpha=0.7)
+        axes[1, 1].set_xlabel('Test R2')
+        axes[1, 1].set_ylabel('TOPSIS Score')
+        axes[1, 1].set_title('Test R2 vs TOPSIS Score')
+        plt.colorbar(scatter, ax=axes[1, 1]).set_label('Traditional Rank')
+        plt.tight_layout()
+        plt.show()
+    
+    def save_best_models(self, comparison_df, top_n=5):
+        """Save best performing models"""
+        top_models = comparison_df.head(top_n)
+        print(f"\nSaving top {top_n} stacking models:")
+        for i, (_, model_data) in enumerate(top_models.iterrows(), 1):
+            model_name = model_data['Model']
+            model = self.stacking_models[model_name]
+            safe_name = model_name.replace(' ', '_').replace('/', '_')
+            filename = f'best_stacking_model_{i}_{safe_name}.pkl'
+            joblib.dump(model, filename)
+            print(f"Saved: {filename}")
+            info_filename = f'best_stacking_model_{i}_{safe_name}_info.txt'
+            with open(info_filename, 'w', encoding='utf-8') as f:
+                f.write(f"Model Name: {model_name}\n")
+                f.write(f"Base Models: {model_data['Base_Models']}\n")
+                f.write(f"TOPSIS Score: {model_data['TOPSIS_Score']:.4f}\n")
+                f.write(f"TOPSIS Rank: {model_data['TOPSIS_Rank']}\n")
+                f.write(f"Test RMSE: {model_data['Test_RMSE']:.4f}\n")
+                f.write(f"Test MAE: {model_data['Test_MAE']:.4f}\n")
+                f.write(f"Test R2: {model_data['Test_R2']:.4f}\n")
+            print(f"Info saved: {info_filename}")
+        comparison_df.to_csv('stacking_models_comprehensive_ranking.csv', index=False)
+        print("Full ranking saved to: stacking_models_comprehensive_ranking.csv")
+    
+    def run_complete_analysis(self, model_paths):
+        """Run complete stacking model analysis pipeline"""
+        print("Starting regression stacking model optimization analysis")
+        print("=" * 50)
+        
+        print("\nStep 1: Loading optimized base models")
+        base_models = self.load_optimized_models(model_paths)
+        if not base_models:
+            print("No base models loaded successfully")
+            return None, None
+        
+        print("\nStep 2: Generating and evaluating stacking combinations")
+        self.evaluate_all_stacking_models(base_models)
+        
+        print("\nStep 3: Compiling evaluation metrics")
+        metrics_df = self.create_metrics_dataframe()
+        if metrics_df is None:
+            print("No evaluation results available")
+            return None, None
+        
+        print("\nStep 4: Saving evaluation metrics")
+        self.save_all_metrics(metrics_df)
+        
+        print("\nStep 5: TOPSIS multi-criteria ranking")
+        comparison_df, topsis_params_df = self.comprehensive_ranking_analysis(metrics_df)
+        topsis_params_df.to_csv('topsis_complete_parameters.csv', index=False)
+        print("TOPSIS parameters saved to: topsis_complete_parameters.csv")
+        
+        print("\n" + "="*80)
+        print("TOPSIS Parameters (Top 10 Models):")
+        print("="*80)
+        display_topsis_columns = ['Model', 'TOPSIS_Score', 'TOPSIS_Rank', 'Distance_to_Best', 'Distance_to_Worst',
+                                  'Test_RMSE_Original', 'Test_R2_Original']
+        print(topsis_params_df[display_topsis_columns].head(10).round(4).to_string(index=False))
+        
+        print("\nFinal Ranking Results:")
+        print("="*80)
+        display_columns = ['Model', 'Base_Models', 'TOPSIS_Score', 'TOPSIS_Rank', 'Traditional_Rank',
+                          'Test_RMSE', 'Test_MAE', 'Test_R2']
+        print(comparison_df[display_columns].head(10).round(4).to_string(index=False))
+        
+        print("\nStep 6: Generating visualizations")
+        self.plot_ranking_comparison(comparison_df)
+        
+        print("\nStep 7: Saving best models")
+        self.save_best_models(comparison_df, top_n=5)
+        
+        print(f"\nAnalysis complete! Best model: {comparison_df.iloc[0]['Model']}")
+        print(f"TOPSIS Score: {comparison_df.iloc[0]['TOPSIS_Score']:.4f}")
+        print(f"Base models: {comparison_df.iloc[0]['Base_Models']}")
+        return comparison_df, topsis_params_df
+
+def load_processed_data():
+    """Load and preprocess data to create train/test splits"""
+    print("Loading and preparing train/test data")
+    df = pd.read_csv('Mg_MOF_74_Data_preprocessing.csv')
+    train_data = df[df['split'] == 'train'].copy()
+    test_data = df[df['split'] == 'test'].copy()
+    target_col = 'Adsorption_capacity_mmol_g'
+    X_train = train_data.drop(columns=[target_col, 'split'])
+    y_train = train_data[target_col]
+    X_test = test_data.drop(columns=[target_col, 'split'])
+    y_test = test_data[target_col]
+    
+    scaler = StandardScaler()
+    X_train_scaled = scaler.fit_transform(X_train)
+    X_test_scaled = scaler.transform(X_test)
+    X_train_scaled = pd.DataFrame(X_train_scaled, columns=X_train.columns)
+    X_test_scaled = pd.DataFrame(X_test_scaled, columns=X_test.columns)
+    print(f"Training set: {X_train_scaled.shape}")
+    print(f"Test set: {X_test_scaled.shape}")
+    return X_train_scaled, X_test_scaled, y_train, y_test
+
+def main():
+    """Main execution function"""
+    try:
+        X_train, X_test, y_train, y_test = load_processed_data()
+        model_paths = {
+            'GBRT': 'best_models/GBRT.pkl',
+            'Extra Trees': 'best_models/Extra_Trees.pkl',
+            'XGBoost': 'best_models/XGBoost.pkl',
+            'Random Forest': 'best_models/Random_Forest.pkl',
+            'CatBoost': 'best_models/CatBoost.pkl',
+            'Bagging': 'best_models/Bagging.pkl'
+        }
+        optimizer = StackingRegressorOptimizer(X_train, X_test, y_train, y_test)
+        results, topsis_params = optimizer.run_complete_analysis(model_paths)
+        if results is not None:
+            print("\n" + "="*60)
+            print("Analysis Summary:")
+            print("="*60)
+            print(f"Total stacking models evaluated: {len(optimizer.metrics_results)}")
+            print(f"Best model: {results.iloc[0]['Model']}")
+            print(f"Base model combination: {results.iloc[0]['Base_Models']}")
+            print(f"Best TOPSIS Score: {results.iloc[0]['TOPSIS_Score']:.4f}")
+            print(f"Best model Test RMSE: {results.iloc[0]['Test_RMSE']:.4f}")
+            print(f"Best model Test R2: {results.iloc[0]['Test_R2']:.4f}")
+        else:
+            print("Analysis failed")
+    except Exception as e:
+        print(f"Error: {str(e)}")
+        import traceback
+        traceback.print_exc()
+
+if __name__ == "__main__":
+    main()

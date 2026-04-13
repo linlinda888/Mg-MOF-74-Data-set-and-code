@@ -1,0 +1,145 @@
+
+########One-hot encoding########
+import pandas as pd
+
+# Load imputed data
+df = pd.read_csv('Mg_MOF_74_imputed_data.csv')
+print("Original data shape:", df.shape)
+print("Original columns:\n", df.columns.tolist())
+
+# Identify categorical columns (object or category dtype)
+categorical_cols = df.select_dtypes(include=['object', 'category']).columns.tolist()
+
+if categorical_cols:
+    print(f"\nFound {len(categorical_cols)} categorical columns: {categorical_cols}")
+    
+    # One-hot encode categorical columns
+    df_encoded = pd.get_dummies(df, columns=categorical_cols, drop_first=False, dummy_na=False)
+    
+    print("One-hot encoding completed.")
+    print(f"Encoded data shape: {df_encoded.shape}")
+    print(f"Column increase: {df_encoded.shape[1] - df.shape[1]}")
+    
+    # Save encoded dataset
+    output_file = 'Mg_MOF_74_onehot_encoded.csv'
+    df_encoded.to_csv(output_file, index=False)
+    print(f"\nEncoded data saved as: {output_file}")
+else:
+    print("\nNo categorical columns found. No encoding applied.")
+    df.to_csv('Mg_MOF_74_onehot_encoded.csv', index=False)
+    print("Original data saved as Mg_MOF_74_onehot_encoded.csv (no changes).")
+
+
+########Missing value imputation########
+import pandas as pd
+import numpy as np
+from sklearn.model_selection import train_test_split
+from sklearn.experimental import enable_iterative_imputer
+from sklearn.impute import IterativeImputer
+from sklearn.ensemble import RandomForestRegressor
+import warnings
+warnings.filterwarnings('ignore')
+
+# =============================================================================
+# 1. Load data
+# =============================================================================
+df = pd.read_csv('Mg_MOF_74_onehot_encoded.csv')
+print("Original data shape:", df.shape)
+
+# =============================================================================
+# 2. Define feature columns and target
+# =============================================================================
+target_col = 'Adsorption_capacity_mmol_g'
+num_features_to_impute = ['Molar ratio', 'Vpore_cm3_g', 'dpore']
+
+# Check if required columns exist
+required_cols = num_features_to_impute + [target_col]
+missing_cols = [col for col in required_cols if col not in df.columns]
+if missing_cols:
+    raise ValueError(f"The following columns are missing: {missing_cols}")
+
+# =============================================================================
+# 3. Drop rows with missing target values
+# =============================================================================
+before = len(df)
+df = df.dropna(subset=[target_col])
+after = len(df)
+print(f"Rows removed due to missing target: {before - after}")
+
+# =============================================================================
+# 4. Split into train and test sets
+# =============================================================================
+X = df.drop(columns=[target_col])
+y = df[target_col]
+X_train, X_test, y_train, y_test = train_test_split(
+    X, y, test_size=0.2, random_state=42
+)
+print(f"Training samples: {len(X_train)}, Test samples: {len(X_test)}")
+
+# =============================================================================
+# 5. Multiple imputation for numeric features using IterativeImputer
+# =============================================================================
+X_train_imp = X_train[num_features_to_impute].copy()
+X_test_imp = X_test[num_features_to_impute].copy()
+
+if X_train_imp.isnull().any().any() or X_test_imp.isnull().any().any():
+    n_imputations = 5
+    train_filled_list = []
+    test_filled_list = []
+
+    for i in range(n_imputations):
+        imputer = IterativeImputer(
+            estimator=RandomForestRegressor(n_estimators=100, random_state=42 + i),
+            max_iter=10,
+            random_state=42 + i,
+            sample_posterior=False,
+            min_value=0,
+            initial_strategy='mean'
+        )
+
+        X_train_imp_filled = imputer.fit_transform(X_train_imp)
+        X_test_imp_filled = imputer.transform(X_test_imp)
+
+        train_filled = X_train.copy()
+        test_filled = X_test.copy()
+        for j, col in enumerate(num_features_to_impute):
+            train_filled[col] = X_train_imp_filled[:, j]
+            test_filled[col] = X_test_imp_filled[:, j]
+
+        train_filled_list.append(train_filled)
+        test_filled_list.append(test_filled)
+
+    # Combine imputed datasets (average)
+    X_train_final = pd.concat(train_filled_list).groupby(level=0).mean()
+    X_test_final = pd.concat(test_filled_list).groupby(level=0).mean()
+
+    for col in num_features_to_impute:
+        X_train[col] = X_train_final[col].values
+        X_test[col] = X_test_final[col].values
+
+    print(f"Multiple imputation completed using {n_imputations} datasets (averaged).")
+else:
+    print("No missing values in numeric features; imputation skipped.")
+
+# =============================================================================
+# 6. Combine features and target, add split indicator
+# =============================================================================
+train_df = X_train.copy()
+train_df[target_col] = y_train
+train_df['split'] = 'train'
+
+test_df = X_test.copy()
+test_df[target_col] = y_test
+test_df['split'] = 'test'
+
+final_df = pd.concat([train_df, test_df], axis=0, ignore_index=True)
+
+# =============================================================================
+# 7. Save processed data
+# =============================================================================
+output_file = 'Mg_MOF_74_Data_preprocessing.csv'
+final_df.to_csv(output_file, index=False)
+print(f"\nProcessed data saved to: {output_file}")
+print(f"Final data shape: {final_df.shape}")
+print("Sample counts by split:")
+print(final_df['split'].value_counts())

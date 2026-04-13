@@ -1,0 +1,349 @@
+# -*- coding: utf-8 -*-
+"""
+Mg-MOF-74 Target-Oriented Design Core Algorithm Module
+Implements genetic algorithm-based co-optimization of synthesis and structural parameters
+with group-wise boundary constraints to ensure physical plausibility within empirical data ranges.
+Dependencies: pandas, numpy, scikit-learn, scikit-opt, joblib
+"""
+
+import pandas as pd
+import numpy as np
+from sklearn.preprocessing import StandardScaler
+from sklearn.cluster import KMeans
+from sko.GA import GA
+import joblib
+import warnings
+
+warnings.filterwarnings('ignore')
+
+
+class MgMOF74Designer:
+    """
+    Mg-MOF-74 target-oriented designer.
+    """
+    def __init__(self, data_path, model_path, scaler_path):
+        """
+        Initialize the designer by loading data, model, and scaler; build group constraint bounds.
+
+        Parameters
+        ----------
+        data_path : str
+            Path to the CSV dataset (must contain 'split' and 'Adsorption_capacity_mmol_g' columns)
+        model_path : str
+            Path to the trained ensemble model (.pkl)
+        scaler_path : str
+            Path to the fitted StandardScaler (.pkl)
+        """
+        self.data = pd.read_csv(data_path)
+        self.model = joblib.load(model_path)
+        self.scaler = joblib.load(scaler_path)
+
+        # Define feature columns
+        self.target_col = 'Adsorption_capacity_mmol_g'
+        self.numeric_cols = ['Molar ratio', 'SBET_m2_g', 'Vpore_cm3_g', 'dpore']
+        self.fixed_cols = ['Pressure_MPa', 'Temperature_K']
+        self.cat_vars_names = ['Mg_source', 'Solvent', 'Treatment', 'Morphology']
+
+        # Extract training set
+        self.train_data = self.data[self.data['split'] == 'train'].copy()
+        self.X_train = self.train_data.drop(columns=[self.target_col, 'split'])
+        self.y_train = self.train_data[self.target_col]
+        self.all_cols = self.X_train.columns.tolist()
+
+        # Parse categorical variable categories from one-hot encoding
+        self.cat_vars = {name: [] for name in self.cat_vars_names}
+        for col in self.all_cols:
+            for var in self.cat_vars_names:
+                if col.startswith(var + '_'):
+                    cat_name = col[len(var)+1:]
+                    if cat_name not in self.cat_vars[var]:
+                        self.cat_vars[var].append(cat_name)
+                    break
+        for var in self.cat_vars:
+            self.cat_vars[var].sort()
+
+        # Compute univariate numeric bounds from training data
+        self.numeric_bounds = {}
+        for col in self.numeric_cols:
+            self.numeric_bounds[col] = (self.X_train[col].min(), self.X_train[col].max())
+
+        # Compute SBET/Vpore ratio constraint bounds (2.5% and 97.5% quantiles)
+        ratio_train = self.X_train['SBET_m2_g'] / (self.X_train['Vpore_cm3_g'] + 1e-6)
+        self.ratio_bounds = (ratio_train.quantile(0.025), ratio_train.quantile(0.975))
+
+        # Build group-wise structural bounds based on synthesis condition combinations
+        self.group_bounds = self._build_group_bounds()
+
+    def _get_cat_value(self, row, var_name):
+        """Extract the original category name from a one-hot encoded row."""
+        for cat in self.cat_vars[var_name]:
+            col_name = f"{var_name}_{cat}"
+            if col_name in row.index and row[col_name] == 1:
+                return cat
+        return None
+
+    def _build_group_bounds(self):
+        """
+        Group training data by all combinations of categorical variables and compute
+        min/max for SBET, Vpore, and dpore within each group.
+
+        Returns
+        -------
+        group_bounds : dict
+            Keys: (Mg_source, Solvent, Treatment, Morphology) tuple
+            Values: dict with 'SBET', 'Vpore', 'dpore' min/max lists.
+        """
+        group_bounds = {}
+        for idx, row in self.X_train.iterrows():
+            mg = self._get_cat_value(row, 'Mg_source')
+            sol = self._get_cat_value(row, 'Solvent')
+            treat = self._get_cat_value(row, 'Treatment')
+            morph = self._get_cat_value(row, 'Morphology')
+            if None in (mg, sol, treat, morph):
+                continue
+            key = (mg, sol, treat, morph)
+            sbet = row['SBET_m2_g']
+            vpore = row['Vpore_cm3_g']
+            dpore = row['dpore']
+            if key not in group_bounds:
+                group_bounds[key] = {
+                    'SBET': [sbet, sbet],
+                    'Vpore': [vpore, vpore],
+                    'dpore': [dpore, dpore]
+                }
+            else:
+                group_bounds[key]['SBET'][0] = min(group_bounds[key]['SBET'][0], sbet)
+                group_bounds[key]['SBET'][1] = max(group_bounds[key]['SBET'][1], sbet)
+                group_bounds[key]['Vpore'][0] = min(group_bounds[key]['Vpore'][0], vpore)
+                group_bounds[key]['Vpore'][1] = max(group_bounds[key]['Vpore'][1], vpore)
+                group_bounds[key]['dpore'][0] = min(group_bounds[key]['dpore'][0], dpore)
+                group_bounds[key]['dpore'][1] = max(group_bounds[key]['dpore'][1], dpore)
+        return group_bounds
+
+    def _ratio_penalty(self, cont_vals):
+        """Penalty for SBET/Vpore ratio deviation from historical plausible range."""
+        sbet = cont_vals[1]
+        vpore = cont_vals[2]
+        ratio = sbet / (vpore + 1e-6)
+        q_low, q_high = self.ratio_bounds
+        penalty = 0.0
+        if ratio < q_low:
+            penalty = 1000 * (q_low - ratio)
+        elif ratio > q_high:
+            penalty = 1000 * (ratio - q_high)
+        return penalty
+
+    def _group_penalty(self, cont_vals, cat_names, weight=100.0):
+        """
+        Group constraint penalty to ensure structural parameters fall within
+        the historical feasible domain of the corresponding synthesis condition combination.
+        """
+        key = tuple(cat_names)
+        if key not in self.group_bounds:
+            return 0.0
+        bounds = self.group_bounds[key]
+        penalty = 0.0
+        sbet = cont_vals[1]
+        sbet_min, sbet_max = bounds['SBET']
+        if sbet < sbet_min:
+            rel = (sbet_min - sbet) / (sbet_min + 1e-6)
+            penalty += weight * rel
+        elif sbet > sbet_max:
+            rel = (sbet - sbet_max) / (sbet_max + 1e-6)
+            penalty += weight * rel
+
+        vpore = cont_vals[2]
+        vpore_min, vpore_max = bounds['Vpore']
+        if vpore < vpore_min:
+            rel = (vpore_min - vpore) / (vpore_min + 1e-6)
+            penalty += weight * rel
+        elif vpore > vpore_max:
+            rel = (vpore - vpore_max) / (vpore_max + 1e-6)
+            penalty += weight * rel
+
+        dpore = cont_vals[3]
+        dpore_min, dpore_max = bounds['dpore']
+        if dpore < dpore_min:
+            rel = (dpore_min - dpore) / (dpore_min + 1e-6)
+            penalty += weight * rel
+        elif dpore > dpore_max:
+            rel = (dpore - dpore_max) / (dpore_max + 1e-6)
+            penalty += weight * rel
+        return penalty
+
+    def _construct_feature_vector(self, cont_vals, cat_names, P, T):
+        """Build a complete feature vector for model prediction."""
+        x_vec = np.zeros(len(self.all_cols))
+        for i, col in enumerate(self.numeric_cols):
+            idx = self.all_cols.index(col)
+            x_vec[idx] = cont_vals[i]
+        idx_p = self.all_cols.index('Pressure_MPa')
+        idx_t = self.all_cols.index('Temperature_K')
+        x_vec[idx_p] = P
+        x_vec[idx_t] = T
+        for j, (var, cat_name) in enumerate(zip(self.cat_vars_names, cat_names)):
+            onehot_col = f"{var}_{cat_name}"
+            if onehot_col in self.all_cols:
+                idx = self.all_cols.index(onehot_col)
+                x_vec[idx] = 1.0
+        return x_vec
+
+    def objective_func(self, x, T, P, Q_target, mode, group_penalty_weight):
+        """
+        Genetic algorithm objective function.
+
+        mode='max' : minimize -pred + penalty  (i.e., maximize adsorption)
+        mode='target' : minimize |pred - Q_target| + penalty
+        """
+        n_cont = len(self.numeric_cols)
+        cont_vals = x[:n_cont]
+        cat_indices = x[n_cont:].astype(int)
+
+        # Map categorical indices to category names
+        cat_names = []
+        for j, (var, cats) in enumerate(self.cat_vars.items()):
+            cat_names.append(cats[cat_indices[j]])
+
+        # Build feature vector and predict
+        x_vec = self._construct_feature_vector(cont_vals, cat_names, P, T)
+        x_scaled = self.scaler.transform(x_vec.reshape(1, -1))
+        pred = self.model.predict(x_scaled)[0]
+
+        # Compute penalties
+        penalty_ratio = self._ratio_penalty(cont_vals)
+        penalty_group = self._group_penalty(cont_vals, cat_names, group_penalty_weight)
+
+        if mode == 'target':
+            return abs(pred - Q_target) + penalty_ratio + penalty_group
+        else:  # 'max'
+            return -pred + penalty_ratio + penalty_group
+
+    def run_optimization(self, T=298.0, P=0.1, mode='max', Q_target=None,
+                         pop_size=100, max_iter=150, group_penalty_weight=100.0,
+                         top_n=5, use_clustering=True):
+        """
+        Execute genetic algorithm optimization.
+
+        Parameters
+        ----------
+        T : float, Temperature (K)
+        P : float, Pressure (MPa)
+        mode : str, 'max' or 'target'
+        Q_target : float, Target adsorption capacity (required if mode='target')
+        pop_size : int, Population size
+        max_iter : int, Maximum iterations
+        group_penalty_weight : float, Weight for group constraint penalty
+        top_n : int, Number of candidate solutions to return
+        use_clustering : bool, Whether to use clustering to increase diversity
+
+        Returns
+        -------
+        candidates : list of dict
+            Each dict contains synthesis/structural parameters and predicted adsorption.
+        """
+        n_cont = len(self.numeric_cols)
+        n_cat = len(self.cat_vars)
+        n_dim = n_cont + n_cat
+
+        # Define variable bounds
+        lb = [self.numeric_bounds[col][0] for col in self.numeric_cols] + [0] * n_cat
+        ub = [self.numeric_bounds[col][1] for col in self.numeric_cols] + \
+             [len(self.cat_vars[var]) - 0.5 for var in self.cat_vars]
+
+        # Fitness function closure
+        def func(x):
+            return self.objective_func(x, T, P, Q_target, mode, group_penalty_weight)
+
+        ga = GA(func=func, n_dim=n_dim, size_pop=pop_size, max_iter=max_iter,
+                lb=lb, ub=ub, precision=1e-3)
+        best_x, best_y = ga.run()
+        final_X = ga.X
+        final_Y = ga.Y
+
+        # Select representative candidates
+        if use_clustering and len(final_X) >= top_n:
+            scaler_cluster = StandardScaler()
+            X_cont = final_X[:, :n_cont]
+            X_cont_scaled = scaler_cluster.fit_transform(X_cont)
+            X_cat = final_X[:, n_cont:].astype(int)
+            X_cluster = np.hstack([X_cont_scaled, X_cat * 0.5])
+            n_clusters = min(top_n, len(final_X))
+            kmeans = KMeans(n_clusters=n_clusters, random_state=42, n_init=10).fit(X_cluster)
+            labels = kmeans.labels_
+            centers = kmeans.cluster_centers_
+            representative_idx = []
+            for i in range(n_clusters):
+                cluster_points = X_cluster[labels == i]
+                if len(cluster_points) == 0:
+                    continue
+                center = centers[i]
+                dist = np.linalg.norm(cluster_points - center, axis=1)
+                nearest_idx = np.where(labels == i)[0][np.argmin(dist)]
+                representative_idx.append(nearest_idx)
+            if len(representative_idx) < top_n:
+                additional = [i for i in np.argsort(final_Y)[:top_n] if i not in representative_idx]
+                representative_idx.extend(additional[:top_n - len(representative_idx)])
+            top_idx = representative_idx[:top_n]
+        else:
+            sorted_idx = np.argsort(final_Y)
+            top_idx = sorted_idx[:top_n]
+
+        top_x = final_X[top_idx]
+
+        # Parse candidate solutions
+        candidates = []
+        for x in top_x:
+            cont_vals = x[:n_cont]
+            cat_indices = x[n_cont:].astype(int)
+            cat_names = []
+            for j, (var, cats) in enumerate(self.cat_vars.items()):
+                cat_names.append(cats[cat_indices[j]])
+
+            # Re-predict without penalties for reporting
+            x_vec = self._construct_feature_vector(cont_vals, cat_names, P, T)
+            x_scaled = self.scaler.transform(x_vec.reshape(1, -1))
+            pred = self.model.predict(x_scaled)[0]
+
+            candidate_dict = {}
+            for i, col in enumerate(self.numeric_cols):
+                candidate_dict[col] = cont_vals[i]
+            for j, var in enumerate(self.cat_vars_names):
+                candidate_dict[var] = cat_names[j]
+            candidate_dict['Predicted_Adsorption'] = pred
+            candidates.append(candidate_dict)
+
+        return candidates
+
+
+# ==================== Usage Example ====================
+if __name__ == "__main__":
+    # Initialize designer (update paths as needed)
+    designer = MgMOF74Designer(
+        data_path='Mg_MOF_74.csv',
+        model_path='Bag_ET_GB_RF_XGB.pkl',
+        scaler_path='scaler.pkl'
+    )
+
+    # Run maximization mode
+    print("=== Maximize adsorption mode ===")
+    max_candidates = designer.run_optimization(
+        T=298.0, P=0.1, mode='max',
+        pop_size=100, max_iter=150,
+        top_n=5, use_clustering=True
+    )
+    for i, cand in enumerate(max_candidates, 1):
+        print(f"Candidate {i}: Predicted uptake = {cand['Predicted_Adsorption']:.4f} mmol/g")
+        print(f"  Molar ratio: {cand['Molar ratio']:.2f}, SBET: {cand['SBET_m2_g']:.1f}, Vpore: {cand['Vpore_cm3_g']:.3f}, dpore: {cand['dpore']:.3f}")
+        print(f"  Mg source: {cand['Mg_source']}, Solvent: {cand['Solvent']}, Modification: {cand['Treatment']}, Morphology: {cand['Morphology']}\n")
+
+    # Run target adsorption mode
+    print("=== Target adsorption mode (3.5 mmol/g) ===")
+    target_candidates = designer.run_optimization(
+        T=298.0, P=0.1, mode='target', Q_target=3.5,
+        pop_size=100, max_iter=150,
+        top_n=5, use_clustering=True
+    )
+    for i, cand in enumerate(target_candidates, 1):
+        print(f"Candidate {i}: Predicted uptake = {cand['Predicted_Adsorption']:.4f} mmol/g")
+        print(f"  Molar ratio: {cand['Molar ratio']:.2f}, SBET: {cand['SBET_m2_g']:.1f}, Vpore: {cand['Vpore_cm3_g']:.3f}, dpore: {cand['dpore']:.3f}")
+        print(f"  Mg source: {cand['Mg_source']}, Solvent: {cand['Solvent']}, Modification: {cand['Treatment']}, Morphology: {cand['Morphology']}\n")

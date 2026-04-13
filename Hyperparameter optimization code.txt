@@ -1,0 +1,298 @@
+import time
+import pandas as pd
+import numpy as np
+from sklearn.model_selection import train_test_split, cross_val_score
+from sklearn.preprocessing import StandardScaler
+from sklearn.metrics import mean_squared_error, r2_score
+
+# Import all model classes
+from sklearn.tree import DecisionTreeRegressor
+from sklearn.linear_model import Ridge, Lasso, LinearRegression
+from sklearn.svm import SVR
+from sklearn.neighbors import KNeighborsRegressor
+from sklearn.ensemble import (
+    AdaBoostRegressor,
+    GradientBoostingRegressor,
+    BaggingRegressor,
+    ExtraTreesRegressor,
+    RandomForestRegressor,
+)
+from catboost import CatBoostRegressor
+from ngboost import NGBRegressor
+from xgboost import XGBRegressor
+import lightgbm as lgb
+
+import optuna
+from optuna.samplers import RandomSampler, TPESampler
+
+# ========== 1. Load data ==========
+df = pd.read_csv('Mg_MOF_74_onehot_encoded.csv')
+# Split by 'split' column into train and test sets
+train_data = df[df['split'] == 'train'].copy()
+test_data = df[df['split'] == 'test'].copy()
+
+# Separate features and target
+target_col = 'Adsorption_capacity_mmol_g'
+X_train = train_data.drop(columns=[target_col, 'split'])
+y_train = train_data[target_col]
+X_test = test_data.drop(columns=[target_col, 'split'])
+y_test = test_data[target_col]
+
+# Standardize features (tree-based models are unaffected)
+scaler = StandardScaler()
+X_train_scaled = scaler.fit_transform(X_train)
+X_test_scaled = scaler.transform(X_test)
+
+# ========== 2. Define parameter space functions for each model ==========
+
+def dt_params(trial):
+    return {
+        'max_depth': trial.suggest_int('max_depth', 3, 20),
+        'min_samples_split': trial.suggest_int('min_samples_split', 2, 20),
+        'min_samples_leaf': trial.suggest_int('min_samples_leaf', 1, 10),
+        'max_features': trial.suggest_categorical('max_features', ['sqrt', 'log2', None]),
+        'random_state': 42
+    }
+
+def ridge_params(trial):
+    return {
+        'alpha': trial.suggest_float('alpha', 1e-4, 10.0, log=True),
+        'solver': trial.suggest_categorical('solver', ['auto', 'svd', 'cholesky', 'lsqr', 'sag']),
+        'random_state': 42
+    }
+
+def lasso_params(trial):
+    return {
+        'alpha': trial.suggest_float('alpha', 1e-4, 10.0, log=True),
+        'max_iter': trial.suggest_int('max_iter', 1000, 10000, step=1000),
+        'random_state': 42
+    }
+
+def lr_params(trial):
+    # Linear regression has no hyperparameters, return empty dict for interface consistency
+    return {}
+
+def svr_params(trial):
+    kernel = trial.suggest_categorical('kernel', ['linear', 'poly', 'rbf', 'sigmoid'])
+    params = {
+        'C': trial.suggest_float('C', 0.1, 100, log=True),
+        'epsilon': trial.suggest_float('epsilon', 0.01, 0.5, log=True),
+        'kernel': kernel,
+    }
+    if kernel in ['poly', 'rbf', 'sigmoid']:
+        params['gamma'] = trial.suggest_categorical('gamma', ['scale', 'auto'])
+    return params
+
+def knn_params(trial):
+    return {
+        'n_neighbors': trial.suggest_int('n_neighbors', 3, 20),
+        'weights': trial.suggest_categorical('weights', ['uniform', 'distance']),
+        'p': trial.suggest_int('p', 1, 2),
+    }
+
+def ada_params(trial):
+    return {
+        'n_estimators': trial.suggest_int('n_estimators', 50, 500, step=50),
+        'learning_rate': trial.suggest_float('learning_rate', 0.01, 1.0, log=True),
+        'loss': trial.suggest_categorical('loss', ['linear', 'square', 'exponential']),
+        'random_state': 42
+    }
+
+def gbrt_params(trial):
+    return {
+        'n_estimators': trial.suggest_int('n_estimators', 100, 500, step=50),
+        'max_depth': trial.suggest_int('max_depth', 3, 10),
+        'learning_rate': trial.suggest_float('learning_rate', 0.01, 0.3, log=True),
+        'subsample': trial.suggest_float('subsample', 0.6, 1.0),
+        'min_samples_split': trial.suggest_int('min_samples_split', 2, 10),
+        'random_state': 42
+    }
+
+def bagging_params(trial):
+    return {
+        'n_estimators': trial.suggest_int('n_estimators', 10, 200, step=10),
+        'max_samples': trial.suggest_float('max_samples', 0.5, 1.0),
+        'max_features': trial.suggest_float('max_features', 0.5, 1.0),
+        'random_state': 42
+    }
+
+def ngb_params(trial):
+    return {
+        'n_estimators': trial.suggest_int('n_estimators', 100, 500, step=50),
+        'learning_rate': trial.suggest_float('learning_rate', 0.01, 0.5, log=True),
+        'minibatch_frac': trial.suggest_float('minibatch_frac', 0.5, 1.0),
+        'random_state': 42
+    }
+
+def lgb_params(trial):
+    return {
+        'num_leaves': trial.suggest_int('num_leaves', 15, 127, step=8),
+        'max_depth': trial.suggest_int('max_depth', -1, 20),
+        'learning_rate': trial.suggest_float('learning_rate', 0.01, 0.3, log=True),
+        'n_estimators': trial.suggest_int('n_estimators', 100, 500, step=50),
+        'subsample': trial.suggest_float('subsample', 0.6, 1.0),
+        'colsample_bytree': trial.suggest_float('colsample_bytree', 0.6, 1.0),
+        'reg_alpha': trial.suggest_float('reg_alpha', 1e-8, 10.0, log=True),
+        'reg_lambda': trial.suggest_float('reg_lambda', 1e-8, 10.0, log=True),
+        'random_state': 42,
+        'verbosity': -1
+    }
+
+def et_params(trial):
+    return {
+        'n_estimators': trial.suggest_int('n_estimators', 100, 500, step=50),
+        'max_depth': trial.suggest_categorical('max_depth', [None, 5, 10, 20]),
+        'min_samples_split': trial.suggest_int('min_samples_split', 2, 10),
+        'min_samples_leaf': trial.suggest_int('min_samples_leaf', 1, 5),
+        'max_features': trial.suggest_categorical('max_features', ['sqrt', 'log2', None]),
+        'random_state': 42
+    }
+
+def cb_params(trial):
+    return {
+        'iterations': trial.suggest_int('iterations', 100, 1000, step=100),
+        'learning_rate': trial.suggest_float('learning_rate', 0.01, 0.3, log=True),
+        'depth': trial.suggest_int('depth', 4, 10),
+        'l2_leaf_reg': trial.suggest_float('l2_leaf_reg', 1, 10, log=True),
+        'border_count': trial.suggest_int('border_count', 32, 128, step=16),
+        'random_state': 42,
+        'verbose': 0
+    }
+
+def rf_params(trial):
+    return {
+        'n_estimators': trial.suggest_int('n_estimators', 100, 500, step=50),
+        'max_depth': trial.suggest_categorical('max_depth', [None, 5, 10, 20]),
+        'min_samples_split': trial.suggest_int('min_samples_split', 2, 10),
+        'min_samples_leaf': trial.suggest_int('min_samples_leaf', 1, 5),
+        'max_features': trial.suggest_categorical('max_features', ['sqrt', 'log2', None]),
+        'random_state': 42
+    }
+
+def xgb_params(trial):
+    return {
+        'n_estimators': trial.suggest_int('n_estimators', 100, 500, step=50),
+        'max_depth': trial.suggest_int('max_depth', 3, 9),
+        'learning_rate': trial.suggest_float('learning_rate', 0.01, 0.3, log=True),
+        'subsample': trial.suggest_float('subsample', 0.6, 1.0),
+        'colsample_bytree': trial.suggest_float('colsample_bytree', 0.6, 1.0),
+        'reg_alpha': trial.suggest_float('reg_alpha', 1e-8, 10.0, log=True),
+        'reg_lambda': trial.suggest_float('reg_lambda', 1e-8, 10.0, log=True),
+        'random_state': 42,
+        'verbosity': 0
+    }
+
+# ========== 3. Define optimization function ==========
+
+def optimize_model(
+    model_name,
+    model_class,
+    param_func,
+    X_train,
+    y_train,
+    X_test,
+    y_test,
+    n_trials_rs=30,
+    n_trials_bayes=70,
+    cv=5,
+):
+    """
+    Perform two-stage hyperparameter optimization for a single model.
+    Returns a dictionary with best parameters, CV RMSE, test RMSE, test R², and optimization time.
+    """
+    start_time = time.time()
+
+    def objective(trial):
+        params = param_func(trial)
+        if model_class is LinearRegression:
+            model = model_class()
+        else:
+            model = model_class(**params)
+        scores = cross_val_score(
+            model, X_train, y_train, cv=cv, scoring='neg_mean_squared_error'
+        )
+        return scores.mean()  # return average negative MSE
+
+    # Stage 1: Random search
+    study = optuna.create_study(direction='maximize', sampler=RandomSampler())
+    study.optimize(objective, n_trials=n_trials_rs, show_progress_bar=True)
+
+    # Stage 2: Bayesian optimization
+    study.sampler = TPESampler()
+    study.optimize(objective, n_trials=n_trials_bayes, show_progress_bar=True)
+
+    elapsed = time.time() - start_time
+
+    best_params = study.best_params
+    best_cv_neg_mse = study.best_value
+    best_cv_rmse = np.sqrt(-best_cv_neg_mse)
+
+    # Evaluate on test set with best parameters
+    if model_class is LinearRegression:
+        best_model = model_class()
+    else:
+        best_model = model_class(**best_params)
+    best_model.fit(X_train, y_train)
+    y_pred = best_model.predict(X_test)
+    test_rmse = np.sqrt(mean_squared_error(y_test, y_pred))
+    test_r2 = r2_score(y_test, y_pred)
+
+    return {
+        'Model': model_name,
+        'Best_Params': best_params,
+        'CV_RMSE': best_cv_rmse,
+        'Test_RMSE': test_rmse,
+        'Test_R2': test_r2,
+        'Optimization_Time_sec': elapsed,
+    }
+
+# ========== 4. Define model configurations ==========
+
+model_configs = [
+    ('Decision Tree', DecisionTreeRegressor, dt_params),
+    ('Ridge Regression', Ridge, ridge_params),
+    ('Lasso Regression', Lasso, lasso_params),
+    ('Linear Regression', LinearRegression, lr_params),
+    ('SVR', SVR, svr_params),
+    ('KNN', KNeighborsRegressor, knn_params),
+    ('AdaBoost', AdaBoostRegressor, ada_params),
+    ('GBRT', GradientBoostingRegressor, gbrt_params),
+    ('Bagging', BaggingRegressor, bagging_params),
+    ('NGBoost', NGBRegressor, ngb_params),
+    ('LightGBM', lgb.LGBMRegressor, lgb_params),
+    ('Extra Trees', ExtraTreesRegressor, et_params),
+    ('CatBoost', CatBoostRegressor, cb_params),
+    ('Random Forest', RandomForestRegressor, rf_params),
+    ('XGBoost', XGBRegressor, xgb_params),
+]
+
+# ========== 5. Run optimization and collect results ==========
+
+results = []
+for name, model_class, param_func in model_configs:
+    print(f"\n{'='*60}\nOptimizing {name}...\n{'='*60}")
+    res = optimize_model(
+        model_name=name,
+        model_class=model_class,
+        param_func=param_func,
+        X_train=X_train_scaled,
+        y_train=y_train,
+        X_test=X_test_scaled,
+        y_test=y_test,
+        n_trials_rs=30,
+        n_trials_bayes=70,
+        cv=5,
+    )
+    results.append(res)
+    print(f"Best CV RMSE: {res['CV_RMSE']:.4f}")
+    print(f"Test RMSE: {res['Test_RMSE']:.4f}, Test R2: {res['Test_R2']:.4f}")
+    print(f"Time: {res['Optimization_Time_sec']:.1f} s")
+
+# ========== 6. Summarize and save results ==========
+
+results_df = pd.DataFrame(results)
+results_df['Best_Params'] = results_df['Best_Params'].apply(str)
+for col in ['CV_RMSE', 'Test_RMSE', 'Test_R2']:
+    results_df[col] = results_df[col].round(4)
+results_df.to_csv('model_optimization_results.csv', index=False, encoding='utf-8-sig')
+print("\nOptimization results saved to model_optimization_results.csv")
